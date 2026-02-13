@@ -1,6 +1,6 @@
 // =================================================================================
 // === STRATIFIED RANDOM SAMPLING TOOL - VERSION 2.0 ===============================
-// === UNFCCC Method I + Bayesian Blending + Google Embeddings Stratification ======
+// === UNFCCC Method I + Bayesian Blending + Automatic Stratification ==============
 // =================================================================================
 
 // =================================================================================
@@ -11,17 +11,23 @@ var CONFIG = {
   ANALYSIS_SCALE: 250,
   EMBEDDINGS_SCALE: 10,
   LANDCOVER_SCALE: 100,
+  COVARIATE_SCALE: 30,
   MAX_PIXELS: 1e10,
   MAX_ERROR: 1,
   DEFAULT_CONFIDENCE: 90,
   DEFAULT_MARGIN_OF_ERROR: 20,
   RANDOM_SEED: 42,
   
-  // Clustering parameters for Google Embeddings
+  // Clustering parameters for remote-sensing covariates
   MIN_CLUSTERS: 2,
-  MAX_CLUSTERS: 10,
-  CLUSTER_RESTARTS: 5,
+  MAX_CLUSTERS: 20,
+  CLUSTER_RESTARTS: 3,
   TRAINING_PIXELS: 5000,
+
+  // Covariate quality control parameters
+  MAX_MISSING_FRACTION: 0.4,
+  MIN_STD_DEV: 0.001,
+  MAX_CORRELATION: 0.95,
   
   // Plot sizes per UNFCCC AR-AM-Tool-03 methodology
   FOREST_PLOT_SIZE_HA: 0.04,  // 400 m²
@@ -68,17 +74,43 @@ var soilCarbon = ee.ImageCollection("projects/sat-io/open-datasets/carbon_stocks
 var landcover = ee.Image('COPERNICUS/Landcover/100m/Proba-V-C3/Global/2019')
   .select('discrete_classification');
 
+var copernicus100 = ee.Image('COPERNICUS/Landcover/100m/Proba-V-C3/Global/2019')
+  .select('discrete_classification');
+var dynamicWorld = ee.ImageCollection('GOOGLE/DYNAMICWORLD/V1')
+  .filterDate('2022-01-01', '2022-12-31')
+  .select('label')
+  .mode();
+
 var palettes = require('users/gena/packages:palettes');
 var fcVis = {palette: palettes.colorbrewer.Greens[7], min: 0, max: 20};
 var scVis = {palette: palettes.colorbrewer.Purples[7], min: 5, max: 30};
 
-// Copernicus land cover stratum mapping (excludes water = code 10)
-var COPERNICUS_STRATA = {
-  from: [20, 30, 40, 50, 60, 70, 80, 90, 100, 111, 112, 113, 114, 115, 116, 121, 122, 123, 124, 125, 126, 200],
-  to:   [1,  2,  10, 10, 10, 10, 10,  3,   4,   5,   5,   5,   5,   5,   5,   5,   5,   5,   5,   5,   5,  10],
-  codes: [1, 2, 3, 4, 5],
-  names: ['Shrubland', 'Herbaceous Vegetation', 'Wetland', 'Moss/Lichen', 'Forest'],
-  palette: ['#F77B63', '#ffbb22', '#1C33A6', '#b3ac9f', '#006400']
+var LANDCOVER_DATASETS = {
+  'Copernicus 100m 2019': {
+    image: copernicus100,
+    classBand: 'discrete_classification',
+    scale: 100,
+    labels: {
+      20: 'Shrubland', 30: 'Herbaceous vegetation', 40: 'Cultivated managed vegetation',
+      50: 'Urban / built-up', 60: 'Bare / sparse vegetation', 70: 'Snow and ice',
+      80: 'Permanent water bodies', 90: 'Herbaceous wetland', 100: 'Moss and lichen',
+      111: 'Closed forest evergreen needle leaf', 112: 'Closed forest evergreen broad leaf',
+      113: 'Closed forest deciduous needle leaf', 114: 'Closed forest deciduous broad leaf',
+      115: 'Closed forest mixed', 116: 'Closed forest unknown', 121: 'Open forest evergreen needle leaf',
+      122: 'Open forest evergreen broad leaf', 123: 'Open forest deciduous needle leaf',
+      124: 'Open forest deciduous broad leaf', 125: 'Open forest mixed', 126: 'Open forest unknown',
+      200: 'Oceans / seas'
+    }
+  },
+  'Dynamic World 10m (mode 2022)': {
+    image: dynamicWorld,
+    classBand: 'label',
+    scale: 10,
+    labels: {
+      0: 'Water', 1: 'Trees', 2: 'Grass', 3: 'Flooded vegetation', 4: 'Crops',
+      5: 'Shrub and scrub', 6: 'Built area', 7: 'Bare ground', 8: 'Snow and ice'
+    }
+  }
 };
 
 // =================================================================================
@@ -97,6 +129,10 @@ var AppState = {
   calculatedSampleSize: null,
   stratificationMethod: null,
   numClusters: null,
+  landcoverClasses: [],
+  classSelectionWidgets: [],
+  classRenameWidgets: {},
+  activeStrataDefinitions: [],
   
   reset: function() {
     this.currentAoi = null;
@@ -110,6 +146,10 @@ var AppState = {
     this.calculatedSampleSize = null;
     this.stratificationMethod = null;
     this.numClusters = null;
+    this.landcoverClasses = [];
+    this.classSelectionWidgets = [];
+    this.classRenameWidgets = {};
+    this.activeStrataDefinitions = [];
   }
 };
 
@@ -271,87 +311,256 @@ var Utils = {
 
 var Stratifier = {
   
-  /**
-   * Create strata using Copernicus land cover
-   */
-  createCopernicusStrata: function(aoi) {
-    var strata = landcover.remap(COPERNICUS_STRATA.from, COPERNICUS_STRATA.to).rename('strata');
-    var mask = strata.neq(10); // Exclude water
-    return strata.updateMask(mask).clip(aoi);
+  getLandcoverConfig: function(datasetName) {
+    return LANDCOVER_DATASETS[datasetName] || LANDCOVER_DATASETS['Copernicus 100m 2019'];
   },
-  
-  /**
-   * Create strata using Google Satellite Embeddings with auto-optimization
-   */
-  createEmbeddingsStrata: function(aoi, callback) {
-    // Load Google Satellite Embeddings
-    var embeddings = ee.ImageCollection("GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL")
-      .filterBounds(aoi)
-      .filterDate('2020-01-01', '2024-01-01')
-      .sort('system:time_start', false)
-      .first()
-      .clip(aoi);
-    
-    // Sample embeddings for training
-    var trainingSample = embeddings.sample({
-      region: aoi,
-      scale: CONFIG.EMBEDDINGS_SCALE,
-      numPixels: CONFIG.TRAINING_PIXELS,
-      seed: CONFIG.RANDOM_SEED,
-      geometries: true
-    });
-    
-    // Run unsupervised classification with auto-optimization
-    var clusterer = ee.Clusterer.wekaCascadeKMeans({
-      minClusters: CONFIG.MIN_CLUSTERS,
-      maxClusters: CONFIG.MAX_CLUSTERS,
-      restarts: CONFIG.CLUSTER_RESTARTS,
-      distanceFunction: 'Euclidean'
-    }).train(trainingSample);
-    
-    // Apply clusterer
-    var classified = embeddings.cluster(clusterer).rename('strata');
-    
-    // Get number of clusters found
-    var clusterCount = classified.reduceRegion({
-      reducer: ee.Reducer.countDistinct(),
+
+  loadLandcoverClasses: function(aoi, datasetName, callback) {
+    var dataset = this.getLandcoverConfig(datasetName);
+    var classImage = dataset.image.rename('class').clip(aoi);
+
+    var hist = classImage.reduceRegion({
+      reducer: ee.Reducer.frequencyHistogram(),
       geometry: aoi,
-      scale: CONFIG.EMBEDDINGS_SCALE * 10, // Faster at coarser scale
-      maxPixels: CONFIG.MAX_PIXELS
+      scale: dataset.scale,
+      maxPixels: CONFIG.MAX_PIXELS,
+      tileScale: 4
     });
-    
-    clusterCount.evaluate(function(result, error) {
-      if (error) {
-        callback(null, null, error);
+
+    hist.evaluate(function(result, error) {
+      if (error || !result || !result.class) {
+        callback([], error || 'No classes found inside AOI');
         return;
       }
-      
-      var numClusters = result.strata;
-      
-      // Reproject to match analysis scale
-      var strataResampled = classified.reproject({
-        crs: 'EPSG:4326',
-        scale: CONFIG.ANALYSIS_SCALE
+
+      var keys = Object.keys(result.class).map(function(k) { return parseInt(k, 10); })
+        .sort(function(a, b) { return a - b; });
+
+      var classes = keys.map(function(code) {
+        return {
+          code: code,
+          pixels: result.class[code],
+          name: dataset.labels[code] || ('Class ' + code)
+        };
       });
-      
-      callback(strataResampled.clip(aoi), numClusters, null);
+
+      callback(classes, null);
+    });
+  },
+
+  buildLandcoverStrata: function(aoi, datasetName, selectedClasses, renameMap) {
+    var dataset = this.getLandcoverConfig(datasetName);
+    var classImage = dataset.image.rename('class').clip(aoi);
+
+    var fromCodes = selectedClasses.map(function(item) { return item.code; });
+    var toCodes = selectedClasses.map(function(_, idx) { return idx; });
+
+    var strata = classImage.remap(fromCodes, toCodes, -999).rename('strata');
+    var strataImage = strata.updateMask(strata.neq(-999)).clip(aoi);
+
+    var definitions = selectedClasses.map(function(item, idx) {
+      var customName = renameMap[item.code];
+      return {
+        code: idx,
+        sourceCode: item.code,
+        name: (customName && customName.trim() !== '') ? customName.trim() : item.name
+      };
+    });
+
+    return {
+      image: strataImage,
+      definitions: definitions
+    };
+  },
+
+  buildCovariateStack: function(aoi) {
+    var s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+      .filterBounds(aoi)
+      .filterDate('2022-01-01', '2023-12-31')
+      .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+      .median()
+      .select(['B2', 'B3', 'B4', 'B8', 'B11', 'B12'], ['blue', 'green', 'red', 'nir', 'swir1', 'swir2']);
+
+    var ndvi = s2.normalizedDifference(['nir', 'red']).rename('ndvi');
+    var ndwi = s2.normalizedDifference(['green', 'nir']).rename('ndwi');
+    var ndbi = s2.normalizedDifference(['swir1', 'nir']).rename('ndbi');
+
+    var s1 = ee.ImageCollection('COPERNICUS/S1_GRD')
+      .filterBounds(aoi)
+      .filterDate('2022-01-01', '2023-12-31')
+      .filter(ee.Filter.eq('instrumentMode', 'IW'))
+      .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+      .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))
+      .median()
+      .select(['VV', 'VH'], ['vv', 'vh']);
+
+    var vvMinusVh = s1.select('vv').subtract(s1.select('vh')).rename('vv_vh_diff');
+
+    var dem = ee.Image('USGS/SRTMGL1_003').rename('elevation');
+    var slope = ee.Terrain.slope(dem).rename('slope');
+
+    return s2.addBands([ndvi, ndwi, ndbi, s1, vvMinusVh, dem, slope])
+      .reproject({crs: 'EPSG:4326', scale: CONFIG.COVARIATE_SCALE})
+      .clip(aoi);
+  },
+
+  qualityControlBands: function(stack, aoi, callback) {
+    var bandNames = stack.bandNames();
+    var metrics = stack.reduceRegion({
+      reducer: ee.Reducer.stdDev().combine(ee.Reducer.count(), '', true),
+      geometry: aoi,
+      scale: CONFIG.COVARIATE_SCALE,
+      maxPixels: CONFIG.MAX_PIXELS,
+      tileScale: 4
+    });
+
+    var self = this;
+    ee.Dictionary({bandNames: bandNames, metrics: metrics}).evaluate(function(result, error) {
+      if (error || !result) {
+        callback([], {dropped: [], retained: []}, error || 'QC failed');
+        return;
+      }
+
+      var bands = result.bandNames;
+      var retained = [];
+      var dropped = [];
+      var totalPixels = 1;
+
+      bands.forEach(function(band) {
+        var count = result.metrics[band + '_count'] || 0;
+        if (count > totalPixels) totalPixels = count;
+      });
+
+      bands.forEach(function(band) {
+        var stdDev = result.metrics[band + '_stdDev'] || 0;
+        var count = result.metrics[band + '_count'] || 0;
+        var missingFraction = 1 - (count / totalPixels);
+
+        if (missingFraction > CONFIG.MAX_MISSING_FRACTION) {
+          dropped.push({band: band, reason: 'high_missing'});
+        } else if (stdDev < CONFIG.MIN_STD_DEV) {
+          dropped.push({band: band, reason: 'near_constant'});
+        } else {
+          retained.push(band);
+        }
+      });
+
+      if (retained.length <= 1) {
+        callback(retained, {retained: retained, dropped: dropped}, null);
+        return;
+      }
+
+      var sample = stack.select(retained).sample({
+        region: aoi,
+        scale: CONFIG.COVARIATE_SCALE,
+        numPixels: 1000,
+        seed: CONFIG.RANDOM_SEED,
+        geometries: false
+      });
+
+      sample.limit(1000).evaluate(function(fc, sampleErr) {
+        if (sampleErr || !fc || !fc.features || fc.features.length < 20) {
+          callback(retained, {retained: retained, dropped: dropped}, null);
+          return;
+        }
+
+        var selected = [];
+        retained.forEach(function(band) {
+          var canUse = true;
+          for (var i = 0; i < selected.length; i++) {
+            var corr = self.computeCorrelation(fc.features, band, selected[i]);
+            if (Math.abs(corr) > CONFIG.MAX_CORRELATION) {
+              canUse = false;
+              dropped.push({band: band, reason: 'high_correlation_with_' + selected[i]});
+              break;
+            }
+          }
+          if (canUse) selected.push(band);
+        });
+
+        callback(selected, {retained: selected, dropped: dropped}, null);
+      });
+    });
+  },
+
+  computeCorrelation: function(features, aBand, bBand) {
+    var values = [];
+    for (var i = 0; i < features.length; i++) {
+      var props = features[i].properties || {};
+      if (props[aBand] === null || props[bBand] === null || props[aBand] === undefined || props[bBand] === undefined) continue;
+      values.push([props[aBand], props[bBand]]);
+    }
+    if (values.length < 3) return 0;
+
+    var n = values.length;
+    var sumX = 0, sumY = 0;
+    values.forEach(function(v) { sumX += v[0]; sumY += v[1]; });
+    var meanX = sumX / n;
+    var meanY = sumY / n;
+
+    var num = 0, denX = 0, denY = 0;
+    values.forEach(function(v) {
+      var dx = v[0] - meanX;
+      var dy = v[1] - meanY;
+      num += dx * dy;
+      denX += dx * dx;
+      denY += dy * dy;
+    });
+
+    return num / Math.sqrt((denX * denY) || 1);
+  },
+
+  createCovariateKMeansStrata: function(aoi, k, callback) {
+    var covariateStack = this.buildCovariateStack(aoi);
+    var self = this;
+
+    this.qualityControlBands(covariateStack, aoi, function(validBands, qcSummary, qcError) {
+      if (qcError) {
+        callback(null, null, qcSummary, qcError);
+        return;
+      }
+
+      if (!validBands || validBands.length === 0) {
+        callback(null, null, qcSummary, 'No valid covariates remaining after QC');
+        return;
+      }
+
+      var finalStack = covariateStack.select(validBands);
+
+      var trainingSample = finalStack.sample({
+        region: aoi,
+        scale: CONFIG.COVARIATE_SCALE,
+        numPixels: CONFIG.TRAINING_PIXELS,
+        seed: CONFIG.RANDOM_SEED,
+        geometries: false
+      });
+
+      var clusterer = ee.Clusterer.wekaKMeans({
+        nClusters: k,
+        init: 1,
+        canopies: true,
+        seed: CONFIG.RANDOM_SEED
+      }).train(trainingSample);
+
+      var classified = finalStack.cluster(clusterer).rename('strata').clip(aoi);
+      var definitions = self.generateClusterNames(k).map(function(name, idx) {
+        return {code: idx, sourceCode: idx, name: name};
+      });
+
+      callback(classified, definitions, qcSummary, null);
     });
   },
   
-  /**
-   * Generate dynamic palette for clusters
-   */
   generateClusterPalette: function(numClusters) {
     var baseColors = [
       '#e41a1c', '#377eb8', '#4daf4a', '#984ea3', '#ff7f00',
-      '#ffff33', '#a65628', '#f781bf', '#999999', '#66c2a5'
+      '#ffff33', '#a65628', '#f781bf', '#999999', '#66c2a5',
+      '#fc8d62', '#8da0cb', '#e78ac3', '#a6d854', '#ffd92f',
+      '#e5c494', '#b3b3b3', '#1b9e77', '#d95f02', '#7570b3'
     ];
     return baseColors.slice(0, numClusters);
   },
   
-  /**
-   * Generate cluster names
-   */
   generateClusterNames: function(numClusters) {
     var names = [];
     for (var i = 0; i < numClusters; i++) {
@@ -386,11 +595,11 @@ panel.add(STYLES.HR);
 panel.add(ui.Label('Step 1: Define Area of Interest', STYLES.HEADER));
 
 var aoiSelection = ui.Select({
-  items: ['Draw a polygon', 'Use a GEE Asset'],
+  items: ['Draw a polygon', 'Upload/Use FeatureCollection asset'],
   value: 'Draw a polygon',
   style: {stretch: 'horizontal', margin: '0 8px'},
   onChange: function(value) {
-    assetPanel.style().set('shown', value === 'Use a GEE Asset');
+    assetPanel.style().set('shown', value === 'Upload/Use FeatureCollection asset');
     map.drawingTools().setShown(value === 'Draw a polygon');
   }
 });
@@ -401,41 +610,99 @@ var assetIdBox = ui.Textbox({
 });
 
 var assetPanel = ui.Panel([
-  ui.Label('Enter GEE Asset Path:', STYLES.INSTRUCTION),
+  ui.Label('Enter FeatureCollection/Shapefile Asset Path:', STYLES.INSTRUCTION),
   assetIdBox
 ], null, {shown: false});
 
 panel.add(aoiSelection);
 panel.add(assetPanel);
-panel.add(ui.Label('► Draw a polygon or enter a GEE asset path.', STYLES.INSTRUCTION));
+panel.add(ui.Label('► Draw an AOI polygon or provide an uploaded FeatureCollection/shapefile asset path.', STYLES.INSTRUCTION));
 
 // --- Step 2: Stratification Method ---
 panel.add(ui.Label('Step 2: Select Stratification Method', STYLES.HEADER));
 
 var stratMethodSelect = ui.Select({
   items: [
-    'Copernicus Land Cover (5 classes)',
-    'Google Embeddings AI (auto-optimized)'
+    'Land Cover Based Stratification',
+    'Remote Sensing + ML Stratification'
   ],
-  value: 'Copernicus Land Cover (5 classes)',
+  value: 'Land Cover Based Stratification',
   style: {stretch: 'horizontal', margin: '0 8px'},
   onChange: function(value) {
-    embeddingsPanel.style().set('shown', value.indexOf('Google') !== -1);
+    landcoverPanel.style().set('shown', value.indexOf('Land Cover') !== -1);
+    mlPanel.style().set('shown', value.indexOf('Remote Sensing') !== -1);
   }
 });
 panel.add(stratMethodSelect);
 
-var embeddingsPanel = ui.Panel([
-  ui.Label('Google Embeddings uses self-supervised learning to automatically ' +
-           'identify optimal strata based on spectral-spatial patterns.', STYLES.INFO),
+var landcoverDatasetSelect = ui.Select({
+  items: Object.keys(LANDCOVER_DATASETS),
+  value: 'Copernicus 100m 2019',
+  style: {stretch: 'horizontal'}
+});
+
+var classListPanel = ui.Panel([], null, {margin: '4px 0 0 0'});
+
+var loadClassesButton = ui.Button({
+  label: 'Load Land Cover Classes in AOI',
+  style: {stretch: 'horizontal', margin: '6px 0 0 0'},
+  onClick: function() {
+    classListPanel.clear();
+    var aoi = getAoi();
+    if (!aoi) {
+      classListPanel.add(ui.Label('Define AOI first to load classes.', STYLES.WARNING));
+      return;
+    }
+
+    classListPanel.add(ui.Label('Loading classes from selected dataset...', STYLES.INFO));
+    Stratifier.loadLandcoverClasses(aoi, landcoverDatasetSelect.getValue(), function(classes, error) {
+      classListPanel.clear();
+      if (error || !classes || classes.length === 0) {
+        classListPanel.add(ui.Label('Unable to detect classes: ' + (error || 'No valid classes in AOI'), STYLES.ERROR));
+        return;
+      }
+
+      AppState.landcoverClasses = classes;
+      AppState.classSelectionWidgets = [];
+      AppState.classRenameWidgets = {};
+
+      classListPanel.add(ui.Label('Select classes to include as strata and optionally rename labels.', STYLES.INSTRUCTION));
+      classes.forEach(function(cls) {
+        var checkbox = ui.Checkbox({label: cls.name + ' (code ' + cls.code + ')', value: true});
+        var renameBox = ui.Textbox({
+          placeholder: 'Optional custom name',
+          style: {width: '190px', margin: '0 0 0 8px'}
+        });
+        var row = ui.Panel([checkbox, renameBox], ui.Panel.Layout.flow('horizontal'), {margin: '2px 0'});
+        classListPanel.add(row);
+        AppState.classSelectionWidgets.push({checkbox: checkbox, classInfo: cls});
+        AppState.classRenameWidgets[cls.code] = renameBox;
+      });
+    });
+  }
+});
+
+var landcoverPanel = ui.Panel([
+  ui.Label('Use existing land cover maps, clip to AOI, then choose/rename classes as strata.', STYLES.INFO),
+  ui.Label('Land cover dataset:', STYLES.INSTRUCTION),
+  landcoverDatasetSelect,
+  loadClassesButton,
+  classListPanel
+], null, {shown: true, margin: '4px 8px'});
+panel.add(landcoverPanel);
+
+var kClustersBox = ui.Textbox({value: '6', style: {width: '80px'}});
+var clusterVizCheckbox = ui.Checkbox({label: 'Display clusters immediately after run', value: true});
+
+var mlPanel = ui.Panel([
+  ui.Label('Build a covariate stack (spectral indices, SAR, elevation), run QC, and apply k-means.', STYLES.INFO),
   ui.Panel([
-    ui.Label('Min clusters:'),
-    ui.Textbox({value: '2', style: {width: '50px'}}),
-    ui.Label('Max clusters:'),
-    ui.Textbox({value: '10', style: {width: '50px'}})
-  ], ui.Panel.Layout.flow('horizontal'), {margin: '4px 8px'})
+    ui.Label('Number of strata (k):'),
+    kClustersBox
+  ], ui.Panel.Layout.flow('horizontal'), {margin: '4px 0'}),
+  clusterVizCheckbox
 ], null, {shown: false, margin: '4px 8px'});
-panel.add(embeddingsPanel);
+panel.add(mlPanel);
 
 // --- Step 3: Sample Size Calculator ---
 panel.add(ui.Label('Step 3: Calculate Sample Size', STYLES.HEADER));
@@ -581,25 +848,75 @@ function runAnalysis() {
   
   var stratMethod = stratMethodSelect.getValue();
   AppState.stratificationMethod = stratMethod;
-  
-  if (stratMethod.indexOf('Google') !== -1) {
+
+  if (stratMethod.indexOf('Remote Sensing') !== -1) {
+    var kValidation = Utils.validateNumber(kClustersBox.getValue(), CONFIG.MIN_CLUSTERS, CONFIG.MAX_CLUSTERS, 'Number of clusters (k)');
+    if (!kValidation.valid) {
+      resultsPanel.add(ui.Label(kValidation.message, STYLES.ERROR));
+      return;
+    }
+
+    var k = Math.round(kValidation.value);
     resultsPanel.clear();
-    resultsPanel.add(ui.Label('Running AI-based stratification...', {color: '#666', fontStyle: 'italic'}));
-    
-    Stratifier.createEmbeddingsStrata(AppState.currentAoi, function(strataImage, numClusters, error) {
+    resultsPanel.add(ui.Label('Running remote sensing covariate QC + k-means clustering...', STYLES.INFO));
+
+    Stratifier.createCovariateKMeansStrata(AppState.currentAoi, k, function(strataImage, definitions, qcSummary, error) {
       if (error) {
         resultsPanel.clear();
-        resultsPanel.add(ui.Label('⚠️ Error in clustering: ' + error, STYLES.ERROR));
+        resultsPanel.add(ui.Label('⚠️ Error in ML stratification: ' + error, STYLES.ERROR));
         return;
       }
+
       AppState.strataImage = strataImage;
-      AppState.numClusters = numClusters;
-      // Pass the clusters to the strict calculation
-      calculateStrictMethodI(carbonType, confVal.value, moeVal.value, numClusters);
+      AppState.numClusters = k;
+      AppState.activeStrataDefinitions = definitions;
+
+      if (qcSummary && qcSummary.dropped && qcSummary.dropped.length > 0) {
+        resultsPanel.add(ui.Label('Covariates dropped by QC: ' + qcSummary.dropped.map(function(d) { return d.band + ' (' + d.reason + ')'; }).join(', '), STYLES.WARNING));
+      }
+      resultsPanel.add(ui.Label('Covariates retained: ' + (qcSummary.retained || []).join(', '), STYLES.INFO));
+
+      if (clusterVizCheckbox.getValue()) {
+        map.addLayer(AppState.strataImage, {
+          min: 0,
+          max: k - 1,
+          palette: Stratifier.generateClusterPalette(k)
+        }, 'ML Clusters (k=' + k + ')', false);
+      }
+
+      calculateStrictMethodI(carbonType, confVal.value, moeVal.value, k);
     });
   } else {
-    AppState.strataImage = Stratifier.createCopernicusStrata(AppState.currentAoi);
-    AppState.numClusters = COPERNICUS_STRATA.codes.length;
+    if (!AppState.classSelectionWidgets || AppState.classSelectionWidgets.length === 0) {
+      resultsPanel.add(ui.Label('Load land cover classes first, then choose classes to include.', STYLES.ERROR));
+      return;
+    }
+
+    var selectedClasses = AppState.classSelectionWidgets
+      .filter(function(item) { return item.checkbox.getValue(); })
+      .map(function(item) { return item.classInfo; });
+
+    if (selectedClasses.length === 0) {
+      resultsPanel.add(ui.Label('Select at least one land cover class for stratification.', STYLES.ERROR));
+      return;
+    }
+
+    var renameMap = {};
+    selectedClasses.forEach(function(cls) {
+      renameMap[cls.code] = AppState.classRenameWidgets[cls.code].getValue();
+    });
+
+    var strataOutput = Stratifier.buildLandcoverStrata(
+      AppState.currentAoi,
+      landcoverDatasetSelect.getValue(),
+      selectedClasses,
+      renameMap
+    );
+
+    AppState.strataImage = strataOutput.image;
+    AppState.activeStrataDefinitions = strataOutput.definitions;
+    AppState.numClusters = strataOutput.definitions.length;
+
     calculateStrictMethodI(carbonType, confVal.value, moeVal.value, null);
   }
 }
@@ -779,12 +1096,9 @@ function calculateStrictMethodI(carbonType, confidence, marginOfErrorPercent, nu
     createLegend(numClusters);
     
     // Add Strata Layer to map
-    var palette = numClusters ? 
-      Stratifier.generateClusterPalette(numClusters) : 
-      COPERNICUS_STRATA.palette;
-    
-    var maxVal = numClusters ? numClusters - 1 : COPERNICUS_STRATA.codes.length - 1;
-    map.addLayer(AppState.strataImage, {min: 0, max: maxVal, palette: palette}, 'Strata');
+    var strataCount = AppState.activeStrataDefinitions.length || numClusters || 1;
+    var palette = Stratifier.generateClusterPalette(strataCount);
+    map.addLayer(AppState.strataImage, {min: 0, max: strataCount - 1, palette: palette}, 'Strata');
     
     // Auto-fill points box
     totalPointsBox.setValue(final_n.toString());
@@ -810,7 +1124,7 @@ function calculateStrictMethodI(carbonType, confidence, marginOfErrorPercent, nu
     print('');
     print('─── Per-Stratum Bayesian Blending ───');
     strataData.forEach(function(s, i) {
-      var name = numClusters ? 'Cluster ' + (s.code + 1) : COPERNICUS_STRATA.names[COPERNICUS_STRATA.codes.indexOf(s.code)] || 'Stratum ' + s.code;
+      var name = getStratumNameByCode(s.code);
       print(name + ': Mean ' + s.measuredMean.toFixed(2) + '→' + s.mean.toFixed(2) + 
             ', StdDev ' + s.measuredStdDev.toFixed(2) + '→' + s.stdDev.toFixed(2) +
             ' (w=' + (s.blendWeight * 100).toFixed(0) + '%)');
@@ -822,13 +1136,21 @@ function calculateStrictMethodI(carbonType, confidence, marginOfErrorPercent, nu
   });
 }
 
+function getStratumNameByCode(code) {
+  if (!AppState.activeStrataDefinitions || AppState.activeStrataDefinitions.length === 0) {
+    return 'Stratum ' + code;
+  }
+  for (var i = 0; i < AppState.activeStrataDefinitions.length; i++) {
+    if (AppState.activeStrataDefinitions[i].code === code) return AppState.activeStrataDefinitions[i].name;
+  }
+  return 'Stratum ' + code;
+}
+
 function displayAllocationPlan(plan, totalSize, numClusters) {
   resultsPanel.add(ui.Label(''));
   resultsPanel.add(ui.Label('Stratum Allocation (Neyman Optimal)', STYLES.SUBHEADER));
   
-  var methodLabel = numClusters ? 
-    'Google Embeddings AI (' + numClusters + ' clusters)' : 
-    'Copernicus Land Cover';
+  var methodLabel = AppState.stratificationMethod + ' (' + plan.length + ' strata)';
   
   resultsPanel.add(ui.Label('Method: ' + methodLabel, {fontSize: '12px', color: '#666', margin: '4px 8px'}));
   
@@ -848,14 +1170,8 @@ function displayAllocationPlan(plan, totalSize, numClusters) {
   AppState.stratumCheckboxes = [];
   plan.sort(function(a, b) { return a.strata_code - b.strata_code; });
   
-  var names = numClusters ? 
-    Stratifier.generateClusterNames(numClusters) : 
-    COPERNICUS_STRATA.names;
-  
   plan.forEach(function(s, index) {
-    var stratumName = numClusters ? 
-      'Cluster ' + (s.strata_code + 1) : 
-      (names[COPERNICUS_STRATA.codes.indexOf(s.strata_code)] || 'Unknown');
+    var stratumName = getStratumNameByCode(s.strata_code);
     
     var percentage = ((s.points / totalSize) * 100).toFixed(1);
     var checkbox = ui.Checkbox({value: s.points > 0});
@@ -956,32 +1272,23 @@ function generateStratifiedPoints() {
 
 function createLegend(numClusters) {
   legendPanel.clear();
-  
-  var codes = numClusters ? 
-    Array.from({length: numClusters}, function(_, i) { return i; }) : 
-    COPERNICUS_STRATA.codes;
-  var names = numClusters ? 
-    Stratifier.generateClusterNames(numClusters) : 
-    COPERNICUS_STRATA.names;
-  var palette = numClusters ? 
-    Stratifier.generateClusterPalette(numClusters) : 
-    COPERNICUS_STRATA.palette;
-  
-  codes.forEach(function(code, index) {
+
+  var defs = AppState.activeStrataDefinitions || [];
+  var palette = Stratifier.generateClusterPalette(defs.length || numClusters || 1);
+
+  defs.forEach(function(def, index) {
     var colorBox = ui.Label('', {
       backgroundColor: palette[index],
       padding: '10px',
       margin: '0 8px 0 0'
     });
-    
-    var label = ui.Label(names[index], {fontSize: '12px'});
-    
+
+    var label = ui.Label(def.name + ' (code ' + def.sourceCode + ')', {fontSize: '12px'});
     legendPanel.add(ui.Panel([colorBox, label], ui.Panel.Layout.flow('horizontal'), {margin: '4px 8px'}));
   });
-  
-  if (!numClusters) {
-    legendPanel.add(ui.Label('Note: Water bodies excluded from sampling', 
-      {fontSize: '11px', color: '#999', margin: '8px', fontStyle: 'italic'}));
+
+  if (defs.length === 0) {
+    legendPanel.add(ui.Label('Legend unavailable until strata are generated.', {fontSize: '11px', color: '#999', margin: '8px'}));
   }
 }
 
@@ -1057,7 +1364,7 @@ print('  • Neyman optimal allocation (Eq. 6)');
 print('  • A_ref = 200,000 ha per stratum');
 print('');
 print('Stratification Methods:');
-print('  1. Copernicus Land Cover (5 predefined classes)');
-print('  2. Google Embeddings AI (auto-optimized 2-10 clusters)');
+print('  1. Land Cover Based Stratification (class selection + label editing)');
+print('  2. Remote Sensing + ML Stratification (covariates + k-means)');
 print('');
 print('Ready to use!');
