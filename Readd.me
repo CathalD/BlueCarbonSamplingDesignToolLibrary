@@ -1,0 +1,191 @@
+# Quick Reference: Manual Drawing Workflow (v3.2)
+
+## Step-by-Step Guide for Drawing Strata
+
+### 📝 STEP 1: Enter Stratum Name
+
+**Option A - Use IPCC Tier 1 Preset:**
+```
+Click dropdown → Select ecosystem type
+Examples:
+- High-Marsh
+- Low-Marsh
+- Seagrass-Dense
+- Seagrass-Sparse
+- Generic-Blue-Carbon
+```
+
+**Option B - Enter Custom Name:**
+```
+Type in text box → e.g., "Mixed Marsh"
+```
+
+---
+
+### 🖊️ STEP 2: Start Drawing
+
+```
+Click: [🖊️ Start Drawing Polygon]
+```
+
+**What happens:**
+- ✓ Drawing mode activates on map
+- ✓ "Start Drawing" button becomes disabled (grayed out)
+- ✓ "Finish & Add This Stratum" button becomes enabled (green)
+- ✓ Status shows: "🎨 Drawing active: Click on map to place vertices..."
+
+---
+
+### 🗺️ STEP 3: Draw on Map
+
+**Controls:**
+- **Single click** = Place vertex (corner point)
+- **Double-click** = Complete polygon shape
+- **Drag** = Pan map while drawing
+
+**Tips:**
+- At least 3 vertices required for a polygon
+- Can create complex shapes with many vertices
+- Double-click when ready to finish shape
+- Shape will appear on map when complete
+
+---
+
+### ✓ STEP 4: Finalize Stratum
+
+```
+Click: [✓ Finish & Add This Stratum]
+```
+
+**What happens:**
+- ✓ Geometry validated and added to strata list
+- ✓ Success message shows in green
+- ✓ Polygon appears on map with unique color
+- ✓ Stratum name cleared (ready for next)
+- ✓ "Start Drawing" button re-enabled
+- ✓ "Finish & Add" button disabled again
+
+---
+
+## 🔄 Repeat for Additional Strata
+
+### Same Stratum, Multiple Polygons:
+1. Keep the same name
+2. Draw another polygon
+3. Click "Finish & Add"
+4. Repeat as needed
+
+### Different Stratum:
+1. Enter new stratum name
+2. Draw polygon
+3. Click "Finish & Add"
+4. Repeat as needed
+
+---
+
+## ✅ When All Strata Are Drawn
+
+```
+Click: [✓ Finalize Strata & Calculate Areas]
+```
+
+This completes Step 1 and moves you to Step 2 (Carbon Priors).
+
+---
+
+## 🎨 Visual Indicators
+
+| Status | Start Button | Finish Button | Status Color |
+|--------|--------------|---------------|--------------|
+| Ready to draw | Enabled | Disabled | - |
+| Drawing active | Disabled | Enabled | 🔵 Blue |
+| Stratum added | Enabled | Disabled | 🟢 Green |
+| Error occurred | Enabled | Disabled | 🟠 Orange |
+
+---
+
+## ⚠️ Common Issues & Solutions
+
+### "No geometry drawn" error
+**Cause**: Clicked "Finish" before completing polygon  
+**Solution**: Make sure to double-click to complete shape first
+
+### "No stratum name specified" error
+**Cause**: Forgot to enter/select stratum name  
+**Solution**: Enter name in Step 1 before clicking "Start Drawing"
+
+### Shape not appearing on map
+**Cause**: Didn't click "Finish & Add This Stratum" button  
+**Solution**: After double-clicking to complete shape, remember to click the green "Finish" button
+
+### Can't start new drawing
+**Cause**: Previous drawing still active  
+**Solution**: Click "Finish & Add" to complete current stratum first
+
+---
+
+## 📊 Example Session
+
+```
+User wants to create 3 strata: High-Marsh, Low-Marsh, Seagrass-Dense
+
+Step 1: High-Marsh (2 polygons)
+  1a. Select "High-Marsh" from dropdown
+  1b. Click "Start Drawing Polygon"
+  1c. Draw first polygon → double-click to complete
+  1d. Click "Finish & Add This Stratum"
+  
+  1e. Keep "High-Marsh" selected (or re-select)
+  1f. Click "Start Drawing Polygon"
+  1g. Draw second polygon → double-click to complete
+  1h. Click "Finish & Add This Stratum"
+
+Step 2: Low-Marsh (1 polygon)
+  2a. Select "Low-Marsh" from dropdown
+  2b. Click "Start Drawing Polygon"
+  2c. Draw polygon → double-click to complete
+  2d. Click "Finish & Add This Stratum"
+
+Step 3: Seagrass-Dense (1 polygon)
+  3a. Select "Seagrass-Dense" from dropdown
+  3b. Click "Start Drawing Polygon"
+  3c. Draw polygon → double-click to complete
+  3d. Click "Finish & Add This Stratum"
+
+Result: 3 strata with 4 total polygons
+
+Final Step: Click "Finalize Strata & Calculate Areas"
+```
+
+---
+
+## 🎯 Key Takeaways
+
+✅ **Always enter name first** before starting to draw  
+✅ **Double-click** to complete polygon shape  
+✅ **Must click "Finish & Add"** button to save stratum  
+✅ **Can add multiple polygons** to same stratum  
+✅ **Each stratum gets unique color** on map  
+✅ **Status messages guide you** through workflow  
+
+---
+
+## 🔧 Troubleshooting
+
+**Problem**: Nothing happens when I click "Start Drawing"  
+**Check**: Did you enter a stratum name first?
+
+**Problem**: "Finish & Add" button is grayed out  
+**Check**: Did you click "Start Drawing" first?
+
+**Problem**: Polygon disappeared after drawing  
+**Check**: Did you click "Finish & Add This Stratum"?
+
+**Problem**: Strata list shows "None"  
+**Check**: Have you completed the "Finish & Add" step?
+
+---
+
+**Version**: 3.2  
+**Last Updated**: 2025  
+**Status**: Production Ready ✅
