@@ -424,36 +424,50 @@ var StratifiedSampler = {
       iterations++;
     }
     
-    // Round up to ensure adequate sample
+    // Round up to ensure adequate sample and keep inside tool bounds
     var n_total = Math.ceil(n_final);
-    
-    // Ensure minimum total samples
     n_total = Math.max(CONFIG.MIN_TOTAL_SAMPLES, n_total);
-    
-    // UNFCCC Stratified Allocation (Proportional to Area)
-    // Allocate samples proportional to stratum area
+    n_total = Math.min(CONFIG.MAX_TOTAL_SAMPLES, n_total);
+
+    // Ensure feasible minimum allocation when many strata exist
+    var requiredMinimum = L * CONFIG.MIN_SAMPLES_PER_STRATUM;
+    if (n_total < requiredMinimum) {
+      n_total = requiredMinimum;
+    }
+
+    // Allocate samples by area with robust largest-remainder balancing
     strataInfo.forEach(function(s) {
       var proportion = s.areaHa / totalAreaHa;
       var exact = n_total * proportion;
-      s.points = Math.max(CONFIG.MIN_SAMPLES_PER_STRATUM, Math.floor(exact));
-      s._remainder = exact - Math.floor(exact);
+      s.points = Math.floor(exact);
+      s._remainder = exact - s.points;
     });
-    
-    // Adjust to match exact total (largest remainder method)
+
+    // Apply per-stratum minimum first
+    strataInfo.forEach(function(s) {
+      s.points = Math.max(CONFIG.MIN_SAMPLES_PER_STRATUM, s.points);
+    });
+
+    // Reconcile any drift from target total while respecting minimums
     var assigned = strataInfo.reduce(function(sum, s) { return sum + s.points; }, 0);
     var diff = n_total - assigned;
-    
-    if (diff !== 0) {
-      strataInfo.sort(function(a, b) { 
-        return diff > 0 ? b._remainder - a._remainder : a._remainder - b._remainder; 
-      });
-      
-      for (var i = 0; i < Math.abs(diff); i++) {
-        if (diff > 0) {
-          strataInfo[i].points++;
-        } else if (strataInfo[i].points > CONFIG.MIN_SAMPLES_PER_STRATUM) {
-          strataInfo[i].points--;
+
+    if (diff > 0) {
+      strataInfo.sort(function(a, b) { return b._remainder - a._remainder; });
+      for (var addIdx = 0; addIdx < diff; addIdx++) {
+        strataInfo[addIdx % L].points++;
+      }
+    } else if (diff < 0) {
+      strataInfo.sort(function(a, b) { return a._remainder - b._remainder; });
+      var removable = -diff;
+      var iter = 0;
+      while (removable > 0 && iter < (L * CONFIG.MAX_TOTAL_SAMPLES)) {
+        var idx = iter % L;
+        if (strataInfo[idx].points > CONFIG.MIN_SAMPLES_PER_STRATUM) {
+          strataInfo[idx].points--;
+          removable--;
         }
+        iter++;
       }
     }
     
