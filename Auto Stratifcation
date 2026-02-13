@@ -1,0 +1,1063 @@
+// =================================================================================
+// === STRATIFIED RANDOM SAMPLING TOOL - VERSION 2.0 ===============================
+// === UNFCCC Method I + Bayesian Blending + Google Embeddings Stratification ======
+// =================================================================================
+
+// =================================================================================
+// === 1. CONFIGURATION ============================================================
+// =================================================================================
+
+var CONFIG = {
+  ANALYSIS_SCALE: 250,
+  EMBEDDINGS_SCALE: 10,
+  LANDCOVER_SCALE: 100,
+  MAX_PIXELS: 1e10,
+  MAX_ERROR: 1,
+  DEFAULT_CONFIDENCE: 90,
+  DEFAULT_MARGIN_OF_ERROR: 20,
+  RANDOM_SEED: 42,
+  
+  // Clustering parameters for Google Embeddings
+  MIN_CLUSTERS: 2,
+  MAX_CLUSTERS: 10,
+  CLUSTER_RESTARTS: 5,
+  TRAINING_PIXELS: 5000,
+  
+  // Plot sizes per UNFCCC AR-AM-Tool-03 methodology
+  FOREST_PLOT_SIZE_HA: 0.04,  // 400 m²
+  SOIL_PLOT_SIZE_HA: 0.01,    // 100 m²
+  
+  // Bayesian blending parameters
+  A_REF: 200000,  // 200,000 ha
+  
+  // Canada-wide default statistics
+  DEFAULTS: {
+    forest: { mean: 4.14, stdDev: 1.8 },
+    soil: { mean: 13.2, stdDev: 10.0 }
+  },
+  
+  MIN_SAMPLES_PER_STRATUM: 5,
+  MAX_TOTAL_SAMPLES: 10000,
+  MIN_TOTAL_SAMPLES: 20
+};
+
+var STYLES = {
+  TITLE: {fontSize: '28px', fontWeight: 'bold', color: '#005931'},
+  SUBTITLE: {fontSize: '18px', fontWeight: '500', color: '#333333'},
+  PARAGRAPH: {fontSize: '14px', color: '#555555'},
+  HEADER: {fontSize: '16px', fontWeight: 'bold', margin: '16px 0 4px 8px'},
+  SUBHEADER: {fontSize: '14px', fontWeight: 'bold', margin: '10px 0 0 0'},
+  PANEL: {width: '450px', border: '1px solid #cccccc'},
+  HR: ui.Panel(null, ui.Panel.Layout.flow('horizontal'), {
+    border: '1px solid #E0E0E0', margin: '20px 0px'
+  }),
+  INSTRUCTION: {fontSize: '12px', color: '#999999', margin: '4px 8px'},
+  INFO: {fontSize: '12px', color: '#1976D2', margin: '4px 8px'},
+  SUCCESS: {fontSize: '13px', color: '#388E3C', fontWeight: 'bold', margin: '8px'},
+  ERROR: {fontSize: '13px', color: '#D32F2F', fontWeight: 'bold', margin: '8px'},
+  WARNING: {fontSize: '13px', color: '#F57C00', fontStyle: 'italic', margin: '8px'}
+};
+
+// =================================================================================
+// === 2. DATA SOURCES =============================================================
+// =================================================================================
+
+var forestCarbon = ee.ImageCollection("projects/sat-io/open-datasets/carbon_stocks_ca/fc").first();
+var soilCarbon = ee.ImageCollection("projects/sat-io/open-datasets/carbon_stocks_ca/sc").first();
+
+var landcover = ee.Image('COPERNICUS/Landcover/100m/Proba-V-C3/Global/2019')
+  .select('discrete_classification');
+
+var palettes = require('users/gena/packages:palettes');
+var fcVis = {palette: palettes.colorbrewer.Greens[7], min: 0, max: 20};
+var scVis = {palette: palettes.colorbrewer.Purples[7], min: 5, max: 30};
+
+// Copernicus land cover stratum mapping (excludes water = code 10)
+var COPERNICUS_STRATA = {
+  from: [20, 30, 40, 50, 60, 70, 80, 90, 100, 111, 112, 113, 114, 115, 116, 121, 122, 123, 124, 125, 126, 200],
+  to:   [1,  2,  10, 10, 10, 10, 10,  3,   4,   5,   5,   5,   5,   5,   5,   5,   5,   5,   5,   5,   5,  10],
+  codes: [1, 2, 3, 4, 5],
+  names: ['Shrubland', 'Herbaceous Vegetation', 'Wetland', 'Moss/Lichen', 'Forest'],
+  palette: ['#F77B63', '#ffbb22', '#1C33A6', '#b3ac9f', '#006400']
+};
+
+// =================================================================================
+// === 3. STATE MANAGEMENT =========================================================
+// =================================================================================
+
+var AppState = {
+  currentAoi: null,
+  allocationInfo: null,
+  stratumCheckboxes: [],
+  currentPoints: null,
+  strataLayer: null,
+  strataImage: null,
+  carbonStats: null,
+  currentCarbonType: null,
+  calculatedSampleSize: null,
+  stratificationMethod: null,
+  numClusters: null,
+  
+  reset: function() {
+    this.currentAoi = null;
+    this.allocationInfo = null;
+    this.stratumCheckboxes = [];
+    this.currentPoints = null;
+    this.strataLayer = null;
+    this.strataImage = null;
+    this.carbonStats = null;
+    this.currentCarbonType = null;
+    this.calculatedSampleSize = null;
+    this.stratificationMethod = null;
+    this.numClusters = null;
+  }
+};
+
+// =================================================================================
+// === 4. UTILITY FUNCTIONS ========================================================
+// =================================================================================
+
+var Utils = {
+  
+  validateNumber: function(value, min, max, name) {
+    var num = parseFloat(value);
+    if (isNaN(num) || num < min || num > max) {
+      return {valid: false, message: name + ' must be between ' + min + ' and ' + max};
+    }
+    return {valid: true, value: num};
+  },
+  
+  formatNumber: function(num, decimals) {
+    decimals = decimals !== undefined ? decimals : 2;
+    if (num === null || num === undefined) return 'N/A';
+    return num.toLocaleString('en-US', {
+      minimumFractionDigits: decimals,
+      maximumFractionDigits: decimals
+    });
+  },
+  
+  /**
+   * Calculate Z-score using polynomial approximation
+   */
+  calculateZScore: function(confidencePercent) {
+    var alpha = 1 - (confidencePercent / 100);
+    return 2.41 + (-10.9 * alpha) + (37.7 * Math.pow(alpha, 2)) - (57.9 * Math.pow(alpha, 3));
+  },
+  
+  /**
+   * Apply Bayesian blending to measured statistics
+   */
+  applyBayesianBlending: function(measuredMean, measuredStdDev, areaHa, carbonType) {
+    var defaults = CONFIG.DEFAULTS[carbonType];
+    var w = areaHa / (areaHa + CONFIG.A_REF);
+    
+    var blendedMean = (w * measuredMean) + ((1 - w) * defaults.mean);
+    var blendedStdDev = (w * measuredStdDev) + ((1 - w) * defaults.stdDev);
+    
+    return {
+      mean: blendedMean,
+      stdDev: blendedStdDev,
+      weight: w,
+      measuredMean: measuredMean,
+      measuredStdDev: measuredStdDev
+    };
+  },
+  
+  /**
+   * Calculate sample size using UNFCCC Method I (Equation 5)
+   * With Bayesian blending
+   */
+  calculateSampleSize: function(measuredMean, measuredStdDev, confidence, marginOfErrorPercent, areaHa, plotSizeHa, carbonType) {
+    if (!measuredMean || measuredMean === 0 || !measuredStdDev || measuredStdDev === 0 || !areaHa || areaHa === 0) {
+      return null;
+    }
+    
+    // Apply Bayesian blending
+    var blended = this.applyBayesianBlending(measuredMean, measuredStdDev, areaHa, carbonType);
+    var mean = blended.mean;
+    var stdDev = blended.stdDev;
+    
+    // Population size (UNFCCC Equation 1)
+    var N = areaHa / plotSizeHa;
+    
+    // Allowable error
+    var E = mean * (marginOfErrorPercent / 100);
+    
+    // Z-score
+    var z = this.calculateZScore(confidence);
+    
+    // UNFCCC Method I (Equation 5)
+    var numerator = Math.pow(N * stdDev, 2);
+    var denomPart1 = Math.pow((N * E) / z, 2);
+    var denomPart2 = N * Math.pow(stdDev, 2);
+    var n = numerator / (denomPart1 + denomPart2);
+    
+    var cv = (stdDev / mean) * 100;
+    var samplingFraction = (n / N) * 100;
+    
+    return {
+      sampleSize: Math.ceil(n),
+      zScore: z,
+      marginOfErrorAbsolute: E,
+      cv: cv,
+      populationN: Math.floor(N),
+      samplingFraction: samplingFraction,
+      blendWeight: blended.weight,
+      blendedMean: mean,
+      blendedStdDev: stdDev,
+      measuredMean: blended.measuredMean,
+      measuredStdDev: blended.measuredStdDev
+    };
+  },
+  
+  /**
+   * Calculate carbon statistics for a region
+   */
+  calculateCarbonStats: function(region, carbonType) {
+    var carbonImage = carbonType === 'forest' ? forestCarbon : soilCarbon;
+    
+    var stats = carbonImage.reduceRegion({
+      reducer: ee.Reducer.mean()
+        .combine(ee.Reducer.stdDev(), '', true)
+        .combine(ee.Reducer.count(), '', true)
+        .combine(ee.Reducer.minMax(), '', true),
+      geometry: region,
+      scale: CONFIG.ANALYSIS_SCALE,
+      maxPixels: CONFIG.MAX_PIXELS
+    });
+    
+    var areaM2 = region.area({maxError: CONFIG.MAX_ERROR});
+    return ee.Dictionary(stats).set('area_m2', areaM2);
+  },
+  
+  /**
+   * Improved rounding adjustment using largest remainder method
+   */
+  adjustRoundingErrors: function(allocations, totalTarget) {
+    var withRemainders = allocations.map(function(s, i) {
+      var exact = s.exactProportion * totalTarget;
+      var floored = Math.floor(exact);
+      return {
+        index: i,
+        floored: floored,
+        remainder: exact - floored
+      };
+    });
+    
+    allocations.forEach(function(s, i) {
+      s.points = Math.max(CONFIG.MIN_SAMPLES_PER_STRATUM, withRemainders[i].floored);
+    });
+    
+    var currentSum = allocations.reduce(function(sum, s) {
+      return sum + s.points;
+    }, 0);
+    var remaining = totalTarget - currentSum;
+    
+    withRemainders.sort(function(a, b) {
+      return b.remainder - a.remainder;
+    });
+    
+    for (var i = 0; i < remaining && i < withRemainders.length; i++) {
+      allocations[withRemainders[i].index].points += 1;
+    }
+    
+    return allocations;
+  }
+};
+
+// =================================================================================
+// === 5. STRATIFICATION METHODS ===================================================
+// =================================================================================
+
+var Stratifier = {
+  
+  /**
+   * Create strata using Copernicus land cover
+   */
+  createCopernicusStrata: function(aoi) {
+    var strata = landcover.remap(COPERNICUS_STRATA.from, COPERNICUS_STRATA.to).rename('strata');
+    var mask = strata.neq(10); // Exclude water
+    return strata.updateMask(mask).clip(aoi);
+  },
+  
+  /**
+   * Create strata using Google Satellite Embeddings with auto-optimization
+   */
+  createEmbeddingsStrata: function(aoi, callback) {
+    // Load Google Satellite Embeddings
+    var embeddings = ee.ImageCollection("GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL")
+      .filterBounds(aoi)
+      .filterDate('2020-01-01', '2024-01-01')
+      .sort('system:time_start', false)
+      .first()
+      .clip(aoi);
+    
+    // Sample embeddings for training
+    var trainingSample = embeddings.sample({
+      region: aoi,
+      scale: CONFIG.EMBEDDINGS_SCALE,
+      numPixels: CONFIG.TRAINING_PIXELS,
+      seed: CONFIG.RANDOM_SEED,
+      geometries: true
+    });
+    
+    // Run unsupervised classification with auto-optimization
+    var clusterer = ee.Clusterer.wekaCascadeKMeans({
+      minClusters: CONFIG.MIN_CLUSTERS,
+      maxClusters: CONFIG.MAX_CLUSTERS,
+      restarts: CONFIG.CLUSTER_RESTARTS,
+      distanceFunction: 'Euclidean'
+    }).train(trainingSample);
+    
+    // Apply clusterer
+    var classified = embeddings.cluster(clusterer).rename('strata');
+    
+    // Get number of clusters found
+    var clusterCount = classified.reduceRegion({
+      reducer: ee.Reducer.countDistinct(),
+      geometry: aoi,
+      scale: CONFIG.EMBEDDINGS_SCALE * 10, // Faster at coarser scale
+      maxPixels: CONFIG.MAX_PIXELS
+    });
+    
+    clusterCount.evaluate(function(result, error) {
+      if (error) {
+        callback(null, null, error);
+        return;
+      }
+      
+      var numClusters = result.strata;
+      
+      // Reproject to match analysis scale
+      var strataResampled = classified.reproject({
+        crs: 'EPSG:4326',
+        scale: CONFIG.ANALYSIS_SCALE
+      });
+      
+      callback(strataResampled.clip(aoi), numClusters, null);
+    });
+  },
+  
+  /**
+   * Generate dynamic palette for clusters
+   */
+  generateClusterPalette: function(numClusters) {
+    var baseColors = [
+      '#e41a1c', '#377eb8', '#4daf4a', '#984ea3', '#ff7f00',
+      '#ffff33', '#a65628', '#f781bf', '#999999', '#66c2a5'
+    ];
+    return baseColors.slice(0, numClusters);
+  },
+  
+  /**
+   * Generate cluster names
+   */
+  generateClusterNames: function(numClusters) {
+    var names = [];
+    for (var i = 0; i < numClusters; i++) {
+      names.push('Cluster ' + (i + 1));
+    }
+    return names;
+  }
+};
+
+// =================================================================================
+// === 6. USER INTERFACE ===========================================================
+// =================================================================================
+
+ui.root.clear();
+var map = ui.Map();
+var panel = ui.Panel({style: STYLES.PANEL});
+var splitPanel = ui.SplitPanel(panel, map, 'horizontal', false);
+ui.root.add(splitPanel);
+map.setCenter(-95, 55, 4);
+
+// --- Header ---
+panel.add(ui.Label('Nature Meets Carbon - Sampling Toolkit', STYLES.TITLE));
+panel.add(ui.Label('Stratified Random Sampling', STYLES.SUBTITLE));
+panel.add(ui.Label(
+  'Stratify your AOI using land cover classes or AI-based clustering, ' +
+  'calculate optimal sample allocation, and generate stratified random sampling points.',
+  STYLES.PARAGRAPH
+));
+panel.add(STYLES.HR);
+
+// --- Step 1: Define AOI ---
+panel.add(ui.Label('Step 1: Define Area of Interest', STYLES.HEADER));
+
+var aoiSelection = ui.Select({
+  items: ['Draw a polygon', 'Use a GEE Asset'],
+  value: 'Draw a polygon',
+  style: {stretch: 'horizontal', margin: '0 8px'},
+  onChange: function(value) {
+    assetPanel.style().set('shown', value === 'Use a GEE Asset');
+    map.drawingTools().setShown(value === 'Draw a polygon');
+  }
+});
+
+var assetIdBox = ui.Textbox({
+  placeholder: 'e.g., users/your_name/your_asset',
+  style: {stretch: 'horizontal', margin: '0 8px'}
+});
+
+var assetPanel = ui.Panel([
+  ui.Label('Enter GEE Asset Path:', STYLES.INSTRUCTION),
+  assetIdBox
+], null, {shown: false});
+
+panel.add(aoiSelection);
+panel.add(assetPanel);
+panel.add(ui.Label('► Draw a polygon or enter a GEE asset path.', STYLES.INSTRUCTION));
+
+// --- Step 2: Stratification Method ---
+panel.add(ui.Label('Step 2: Select Stratification Method', STYLES.HEADER));
+
+var stratMethodSelect = ui.Select({
+  items: [
+    'Copernicus Land Cover (5 classes)',
+    'Google Embeddings AI (auto-optimized)'
+  ],
+  value: 'Copernicus Land Cover (5 classes)',
+  style: {stretch: 'horizontal', margin: '0 8px'},
+  onChange: function(value) {
+    embeddingsPanel.style().set('shown', value.indexOf('Google') !== -1);
+  }
+});
+panel.add(stratMethodSelect);
+
+var embeddingsPanel = ui.Panel([
+  ui.Label('Google Embeddings uses self-supervised learning to automatically ' +
+           'identify optimal strata based on spectral-spatial patterns.', STYLES.INFO),
+  ui.Panel([
+    ui.Label('Min clusters:'),
+    ui.Textbox({value: '2', style: {width: '50px'}}),
+    ui.Label('Max clusters:'),
+    ui.Textbox({value: '10', style: {width: '50px'}})
+  ], ui.Panel.Layout.flow('horizontal'), {margin: '4px 8px'})
+], null, {shown: false, margin: '4px 8px'});
+panel.add(embeddingsPanel);
+
+// --- Step 3: Sample Size Calculator ---
+panel.add(ui.Label('Step 3: Calculate Sample Size', STYLES.HEADER));
+
+var carbonTypeSelect = ui.Select({
+  items: ['Forest Carbon', 'Soil Carbon'],
+  value: 'Soil Carbon',
+  style: {stretch: 'horizontal', margin: '0 8px'}
+});
+panel.add(ui.Label('Carbon Type for Sample Size:', STYLES.INSTRUCTION));
+panel.add(carbonTypeSelect);
+
+var confidenceBox = ui.Textbox({
+  placeholder: 'e.g., 90',
+  value: CONFIG.DEFAULT_CONFIDENCE.toString(),
+  style: {width: '80px', margin: '0 8px'}
+});
+
+var marginOfErrorBox = ui.Textbox({
+  placeholder: 'e.g., 20',
+  value: CONFIG.DEFAULT_MARGIN_OF_ERROR.toString(),
+  style: {width: '80px', margin: '0 8px'}
+});
+
+panel.add(ui.Panel([
+  ui.Label('Confidence Level (%):'),
+  confidenceBox
+], ui.Panel.Layout.flow('horizontal'), {margin: '4px 8px'}));
+
+panel.add(ui.Panel([
+  ui.Label('Margin of Error (%):'),
+  marginOfErrorBox
+], ui.Panel.Layout.flow('horizontal'), {margin: '4px 8px'}));
+
+var calculateButton = ui.Button({
+  label: 'Calculate Sample Size & Run Stratification',
+  style: {stretch: 'horizontal', margin: '8px'},
+  onClick: runAnalysis
+});
+panel.add(calculateButton);
+
+var resultsPanel = ui.Panel({style: {margin: '0 8px'}});
+panel.add(resultsPanel);
+
+// --- Step 4: Generate Points ---
+panel.add(ui.Label('Step 4: Generate & Export Points', STYLES.HEADER));
+
+var totalPointsBox = ui.Textbox({
+  placeholder: 'Enter total points or use recommendation...',
+  style: {stretch: 'horizontal', margin: '0 8px'}
+});
+panel.add(totalPointsBox);
+panel.add(ui.Label('► Enter total points or use the calculated recommendation.', STYLES.INSTRUCTION));
+
+var generateButton = ui.Button({
+  label: 'Generate Stratified Points',
+  style: {stretch: 'horizontal', margin: '8px'},
+  disabled: true,
+  onClick: generateStratifiedPoints
+});
+panel.add(generateButton);
+
+var formatSelect = ui.Select({
+  items: ['CSV', 'GeoJSON', 'KML', 'SHP'],
+  value: 'CSV',
+  style: {stretch: 'horizontal', margin: '0 8px'}
+});
+panel.add(ui.Label('Export Format:', {margin: '8px 8px 4px 8px', fontWeight: 'bold'}));
+panel.add(formatSelect);
+
+var exportButton = ui.Button({
+  label: '⬇️ Generate Download Link',
+  style: {stretch: 'horizontal', margin: '8px'},
+  disabled: true
+});
+panel.add(exportButton);
+
+var downloadLinksPanel = ui.Panel({style: {margin: '0 8px'}});
+panel.add(downloadLinksPanel);
+
+var clearButton = ui.Button({
+  label: 'Clear All & Start Over',
+  style: {stretch: 'horizontal', margin: '8px'},
+  onClick: clearAll
+});
+panel.add(clearButton);
+
+// --- Legend Panel ---
+var legendPanel = ui.Panel({style: {margin: '0 8px'}});
+panel.add(ui.Label('Strata Legend', STYLES.HEADER));
+panel.add(legendPanel);
+
+// =================================================================================
+// === 7. CORE FUNCTIONS ===========================================================
+// =================================================================================
+
+function getAoi() {
+  var method = aoiSelection.getValue();
+  if (method === 'Draw a polygon') {
+    var layers = map.drawingTools().layers();
+    if (layers.length() === 0 || layers.get(0).geometries().length() === 0) return null;
+    return layers.get(0).toGeometry();
+  } else {
+    var assetId = assetIdBox.getValue();
+    if (!assetId || assetId.trim() === '') return null;
+    try { return ee.FeatureCollection(assetId.trim()).geometry(); } catch (e) { return null; }
+  }
+}
+
+function runAnalysis() {
+  resultsPanel.clear();
+  legendPanel.clear();
+  map.layers().reset();
+  
+  AppState.currentAoi = getAoi();
+  if (!AppState.currentAoi) {
+    resultsPanel.add(ui.Label('⚠️ Please define an area of interest first!', STYLES.ERROR));
+    return;
+  }
+  
+  var confVal = Utils.validateNumber(confidenceBox.getValue(), 70, 99.9, 'Confidence level');
+  var moeVal = Utils.validateNumber(marginOfErrorBox.getValue(), 1, 50, 'Margin of error');
+  if (!confVal.valid) {
+    resultsPanel.add(ui.Label(confVal.message, STYLES.ERROR));
+    return;
+  }
+  if (!moeVal.valid) {
+    resultsPanel.add(ui.Label(moeVal.message, STYLES.ERROR));
+    return;
+  }
+  
+  resultsPanel.add(ui.Label('Processing stratification and calculating stats per stratum...', {color: '#666', fontStyle: 'italic'}));
+  
+  map.centerObject(AppState.currentAoi, 10);
+  map.addLayer(AppState.currentAoi, {color: 'E53935'}, 'AOI');
+  
+  var carbonType = carbonTypeSelect.getValue() === 'Forest Carbon' ? 'forest' : 'soil';
+  AppState.currentCarbonType = carbonType;
+  
+  // Display context layers
+  map.addLayer(forestCarbon.clip(AppState.currentAoi), fcVis, 'Forest Carbon', false);
+  map.addLayer(soilCarbon.clip(AppState.currentAoi), scVis, 'Soil Carbon', false);
+  
+  var stratMethod = stratMethodSelect.getValue();
+  AppState.stratificationMethod = stratMethod;
+  
+  if (stratMethod.indexOf('Google') !== -1) {
+    resultsPanel.clear();
+    resultsPanel.add(ui.Label('Running AI-based stratification...', {color: '#666', fontStyle: 'italic'}));
+    
+    Stratifier.createEmbeddingsStrata(AppState.currentAoi, function(strataImage, numClusters, error) {
+      if (error) {
+        resultsPanel.clear();
+        resultsPanel.add(ui.Label('⚠️ Error in clustering: ' + error, STYLES.ERROR));
+        return;
+      }
+      AppState.strataImage = strataImage;
+      AppState.numClusters = numClusters;
+      // Pass the clusters to the strict calculation
+      calculateStrictMethodI(carbonType, confVal.value, moeVal.value, numClusters);
+    });
+  } else {
+    AppState.strataImage = Stratifier.createCopernicusStrata(AppState.currentAoi);
+    AppState.numClusters = COPERNICUS_STRATA.codes.length;
+    calculateStrictMethodI(carbonType, confVal.value, moeVal.value, null);
+  }
+}
+
+/**
+ * STRICT UNFCCC METHOD I IMPLEMENTATION (Equation 5)
+ * 
+ * This is the proper multi-strata implementation:
+ * 1. Calculate Stats per Stratum
+ * 2. Apply Bayesian Blend per Stratum
+ * 3. Calculate Total n using Sum of Strata components
+ * 4. Allocate via Neyman (Equation 6)
+ * 
+ * Formula (Equation 5):
+ *   n = [Σ(Ni × sti)]² / [(N × E/z)² + Σ(Ni × sti²)]
+ * 
+ * Where:
+ *   Ni = Area_i / Plot_Size (max plots per stratum)
+ *   N = Σ Ni (total max plots)
+ *   sti = blended standard deviation for stratum i
+ *   E = Q × p (allowable error based on weighted mean)
+ *   z = z-score for confidence level
+ */
+function calculateStrictMethodI(carbonType, confidence, marginOfErrorPercent, numClusters) {
+  var carbonImage = carbonType === 'forest' ? forestCarbon : soilCarbon;
+  var plotSizeHa = carbonType === 'forest' ? CONFIG.FOREST_PLOT_SIZE_HA : CONFIG.SOIL_PLOT_SIZE_HA;
+  
+  // 1. Grouped Reduction to get stats PER STRATUM
+  var analysisImage = carbonImage.rename('carbon')
+    .addBands(AppState.strataImage)
+    .clip(AppState.currentAoi);
+
+  var reducer = ee.Reducer.mean().combine(ee.Reducer.stdDev(), null, true)
+    .combine(ee.Reducer.count(), null, true)
+    .group({groupField: 1, groupName: 'strata_code'});
+    
+  var stats = analysisImage.reduceRegion({
+    reducer: reducer,
+    geometry: AppState.currentAoi,
+    scale: CONFIG.ANALYSIS_SCALE,
+    maxPixels: CONFIG.MAX_PIXELS,
+    tileScale: 4 // Robust against memory errors
+  });
+  
+  stats.evaluate(function(statsDict, error) {
+    resultsPanel.clear();
+    
+    if (error || !statsDict || !statsDict.groups || statsDict.groups.length === 0) {
+      resultsPanel.add(ui.Label('⚠️ Error calculating strata stats: ' + (error || 'No valid strata found'), STYLES.ERROR));
+      return;
+    }
+
+    var groups = statsDict.groups;
+    var z = Utils.calculateZScore(confidence);
+    
+    // Process each stratum to prepare Method I inputs
+    var strataData = groups.map(function(g) {
+      // Calculate area in hectares from pixel count
+      var areaHa = (g.count * CONFIG.ANALYSIS_SCALE * CONFIG.ANALYSIS_SCALE) / 10000;
+      
+      // Apply Bayesian Blending to THIS STRATUM's stats
+      var blended = Utils.applyBayesianBlending(g.mean, g.stdDev, areaHa, carbonType);
+      
+      return {
+        code: g.strata_code,
+        count: g.count,
+        areaHa: areaHa,
+        Ni: areaHa / plotSizeHa, // Max possible plots in stratum (Equation 1)
+        mean: blended.mean,
+        stdDev: blended.stdDev, // This is st_i (blended)
+        measuredMean: g.mean,
+        measuredStdDev: g.stdDev,
+        blendWeight: blended.weight
+      };
+    });
+
+    // -------------------------------------------------------------------------
+    // 2. Calculate Weighted Sums for Method I (Equation 5)
+    // Formula: n = [Σ(Ni × sti)]² / [(N × E/z)² + Σ(Ni × sti²)]
+    // -------------------------------------------------------------------------
+    
+    var sum_Ni_Si = 0;       // Numerator: Σ(Ni × sti)
+    var sum_Ni_Si2 = 0;      // Denominator term: Σ(Ni × sti²)
+    var total_N = 0;         // Total population: Σ Ni
+    var weightedMeanQ = 0;   // For calculating allowable error E
+    var totalArea = 0;
+
+    strataData.forEach(function(s) {
+      sum_Ni_Si += s.Ni * s.stdDev;
+      sum_Ni_Si2 += s.Ni * Math.pow(s.stdDev, 2);
+      total_N += s.Ni;
+      weightedMeanQ += s.mean * s.areaHa;
+      totalArea += s.areaHa;
+    });
+
+    // Area-weighted mean carbon stock
+    weightedMeanQ = weightedMeanQ / totalArea;
+    
+    // Allowable Error (Equation 2): E = Q × precision
+    var E = weightedMeanQ * (marginOfErrorPercent / 100);
+
+    // -------------------------------------------------------------------------
+    // 3. Execute Equation 5
+    // n = [Σ(Ni × sti)]² / [(N × E/z)² + Σ(Ni × sti²)]
+    // -------------------------------------------------------------------------
+    var numerator = Math.pow(sum_Ni_Si, 2);
+    var denom_term_E = Math.pow((total_N * E) / z, 2);
+    var n_calc = numerator / (denom_term_E + sum_Ni_Si2);
+    
+    // Safety clamp
+    var final_n = Math.ceil(Math.max(CONFIG.MIN_TOTAL_SAMPLES, Math.min(n_calc, CONFIG.MAX_TOTAL_SAMPLES)));
+
+    // -------------------------------------------------------------------------
+    // 4. Neyman Allocation (Equation 6)
+    // ni = n × (Ni × sti) / Σ(Ni × sti)
+    // -------------------------------------------------------------------------
+    var allocationPlan = strataData.map(function(s) {
+      var weight = s.Ni * s.stdDev;
+      var exactProportion = weight / sum_Ni_Si;
+      return {
+        strata_code: s.code,
+        count: s.count,
+        areaHa: s.areaHa,
+        Ni: s.Ni,
+        mean: s.mean,
+        stdDev: s.stdDev,
+        measuredMean: s.measuredMean,
+        measuredStdDev: s.measuredStdDev,
+        blendWeight: s.blendWeight,
+        weight: weight,
+        exactProportion: exactProportion,
+        points: 0 // Will be filled by rounding adjustment
+      };
+    });
+    
+    // Apply rounding adjustment using largest remainder method
+    AppState.allocationInfo = Utils.adjustRoundingErrors(allocationPlan, final_n);
+    AppState.calculatedSampleSize = final_n;
+
+    // -------------------------------------------------------------------------
+    // DISPLAY RESULTS
+    // -------------------------------------------------------------------------
+    
+    // Summary Box
+    var summaryPanel = ui.Panel([
+      ui.Label(final_n + ' Total Plots', {
+        fontSize: '24px', fontWeight: 'bold', color: '#005931', margin: '4px 0'
+      }),
+      ui.Label('Strict UNFCCC Method I (Eq. 5) - Multi-Strata', {
+        fontSize: '11px', color: '#666'
+      }),
+      ui.Label('Weighted Mean Carbon: ' + Utils.formatNumber(weightedMeanQ, 2) + ' t/ha', {
+        fontSize: '11px', color: '#666'
+      }),
+      ui.Label('Allowable Error (E): ±' + Utils.formatNumber(E, 2) + ' t/ha', {
+        fontSize: '11px', color: '#666'
+      }),
+      ui.Label('Total Area: ' + Utils.formatNumber(totalArea, 1) + ' ha | ' + strataData.length + ' strata', {
+        fontSize: '11px', color: '#666'
+      })
+    ], null, {
+      border: '2px solid #005931',
+      padding: '12px',
+      margin: '8px 0'
+    });
+    resultsPanel.add(summaryPanel);
+    
+    resultsPanel.add(ui.Label(
+      '► n = [Σ(Ni×sti)]² / [(N×E/z)² + Σ(Ni×sti²)]',
+      STYLES.INFO
+    ));
+
+    // Display allocation plan
+    displayAllocationPlan(AppState.allocationInfo, final_n, numClusters);
+    
+    // Create legend
+    createLegend(numClusters);
+    
+    // Add Strata Layer to map
+    var palette = numClusters ? 
+      Stratifier.generateClusterPalette(numClusters) : 
+      COPERNICUS_STRATA.palette;
+    
+    var maxVal = numClusters ? numClusters - 1 : COPERNICUS_STRATA.codes.length - 1;
+    map.addLayer(AppState.strataImage, {min: 0, max: maxVal, palette: palette}, 'Strata');
+    
+    // Auto-fill points box
+    totalPointsBox.setValue(final_n.toString());
+    generateButton.setDisabled(false);
+    
+    // Print detailed results to console
+    print('═══════════════════════════════════════════════════════');
+    print('📊 STRICT UNFCCC Method I (Equation 5) - Multi-Strata');
+    print('═══════════════════════════════════════════════════════');
+    print('Formula: n = [Σ(Ni×sti)]² / [(N×E/z)² + Σ(Ni×sti²)]');
+    print('');
+    print('Stratification Method:', AppState.stratificationMethod);
+    print('Number of Strata:', strataData.length);
+    print('Total Area:', totalArea.toFixed(1), 'ha');
+    print('');
+    print('─── Method I Components ───');
+    print('Σ(Ni × sti):', sum_Ni_Si.toFixed(2));
+    print('Σ(Ni × sti²):', sum_Ni_Si2.toFixed(2));
+    print('Total N (Σ Ni):', Math.floor(total_N));
+    print('Weighted Mean (Q):', weightedMeanQ.toFixed(2), 't/ha');
+    print('Allowable Error (E):', E.toFixed(2), 't/ha');
+    print('Z-score:', z.toFixed(4));
+    print('');
+    print('─── Per-Stratum Bayesian Blending ───');
+    strataData.forEach(function(s, i) {
+      var name = numClusters ? 'Cluster ' + (s.code + 1) : COPERNICUS_STRATA.names[COPERNICUS_STRATA.codes.indexOf(s.code)] || 'Stratum ' + s.code;
+      print(name + ': Mean ' + s.measuredMean.toFixed(2) + '→' + s.mean.toFixed(2) + 
+            ', StdDev ' + s.measuredStdDev.toFixed(2) + '→' + s.stdDev.toFixed(2) +
+            ' (w=' + (s.blendWeight * 100).toFixed(0) + '%)');
+    });
+    print('');
+    print('─── Final Result ───');
+    print('Calculated n:', n_calc.toFixed(2));
+    print('Final n (rounded):', final_n);
+  });
+}
+
+function displayAllocationPlan(plan, totalSize, numClusters) {
+  resultsPanel.add(ui.Label(''));
+  resultsPanel.add(ui.Label('Stratum Allocation (Neyman Optimal)', STYLES.SUBHEADER));
+  
+  var methodLabel = numClusters ? 
+    'Google Embeddings AI (' + numClusters + ' clusters)' : 
+    'Copernicus Land Cover';
+  
+  resultsPanel.add(ui.Label('Method: ' + methodLabel, {fontSize: '12px', color: '#666', margin: '4px 8px'}));
+  
+  // Table header
+  var tableHeader = ui.Panel([
+    ui.Label('Include', {fontWeight: 'bold', width: '60px'}),
+    ui.Label('Stratum', {fontWeight: 'bold', width: '100px'}),
+    ui.Label('StdDev', {fontWeight: 'bold', width: '60px'}),
+    ui.Label('Points', {fontWeight: 'bold', width: '50px'}),
+    ui.Label('%', {fontWeight: 'bold', width: '40px'})
+  ], ui.Panel.Layout.flow('horizontal'), {
+    backgroundColor: '#E8E8E8',
+    padding: '4px'
+  });
+  resultsPanel.add(tableHeader);
+  
+  AppState.stratumCheckboxes = [];
+  plan.sort(function(a, b) { return a.strata_code - b.strata_code; });
+  
+  var names = numClusters ? 
+    Stratifier.generateClusterNames(numClusters) : 
+    COPERNICUS_STRATA.names;
+  
+  plan.forEach(function(s, index) {
+    var stratumName = numClusters ? 
+      'Cluster ' + (s.strata_code + 1) : 
+      (names[COPERNICUS_STRATA.codes.indexOf(s.strata_code)] || 'Unknown');
+    
+    var percentage = ((s.points / totalSize) * 100).toFixed(1);
+    var checkbox = ui.Checkbox({value: s.points > 0});
+    
+    var row = ui.Panel([
+      ui.Panel([checkbox], null, {width: '60px'}),
+      ui.Label(stratumName, {width: '100px', fontSize: '11px'}),
+      ui.Label(Utils.formatNumber(s.stdDev, 2), {width: '60px', fontSize: '11px'}),
+      ui.Label(String(s.points), {width: '50px', fontWeight: 'bold'}),
+      ui.Label(percentage + '%', {width: '40px', fontSize: '11px'})
+    ], ui.Panel.Layout.flow('horizontal'), {
+      backgroundColor: (index % 2 === 0) ? '#F9F9F9' : '#FFFFFF',
+      padding: '4px'
+    });
+    
+    resultsPanel.add(row);
+    AppState.stratumCheckboxes.push({
+      checkbox: checkbox,
+      stratumInfo: s
+    });
+  });
+}
+
+function generateStratifiedPoints() {
+  var selectedStrata = AppState.stratumCheckboxes.filter(function(item) {
+    return item.checkbox.getValue();
+  });
+  
+  if (selectedStrata.length === 0) {
+    resultsPanel.add(ui.Label('⚠️ Please select at least one stratum.', STYLES.ERROR));
+    return;
+  }
+  
+  var numVal = Utils.validateNumber(totalPointsBox.getValue(), CONFIG.MIN_TOTAL_SAMPLES, CONFIG.MAX_TOTAL_SAMPLES, 'Total points');
+  if (!numVal.valid) {
+    resultsPanel.add(ui.Label(numVal.message, STYLES.ERROR));
+    return;
+  }
+  
+  resultsPanel.add(ui.Label('Generating points...', {color: '#666', fontStyle: 'italic'}));
+  
+  var classValues = selectedStrata.map(function(item) {
+    return item.stratumInfo.strata_code;
+  });
+  var classPoints = selectedStrata.map(function(item) {
+    return item.stratumInfo.points;
+  });
+  
+  var totalSelected = classPoints.reduce(function(sum, n) { return sum + n; }, 0);
+  
+  // Generate stratified sample
+  var samplingPoints = AppState.strataImage.stratifiedSample({
+    numPoints: 0,
+    classBand: 'strata',
+    region: AppState.currentAoi,
+    scale: CONFIG.ANALYSIS_SCALE,
+    classValues: classValues,
+    classPoints: classPoints,
+    geometries: true,
+    seed: CONFIG.RANDOM_SEED
+  });
+  
+  // Add attributes
+  samplingPoints = samplingPoints.map(function(pt) {
+    return pt.set({
+      'carbon_type': AppState.currentCarbonType,
+      'sampling_type': 'stratified_random',
+      'stratification_method': AppState.stratificationMethod
+    });
+  });
+  
+  samplingPoints.size().evaluate(function(count, error) {
+    if (error) {
+      resultsPanel.add(ui.Label('⚠️ Error: ' + error, STYLES.ERROR));
+      return;
+    }
+    
+    AppState.currentPoints = samplingPoints;
+    
+    // Remove old points layer
+    var layers = map.layers();
+    for (var i = layers.length() - 1; i >= 0; i--) {
+      if (layers.get(i).getName().indexOf('Sampling Points') !== -1) {
+        map.layers().remove(layers.get(i));
+      }
+    }
+    
+    // Add new points
+    var color = AppState.currentCarbonType === 'forest' ? '228B22' : '8B4513';
+    map.addLayer(AppState.currentPoints, {color: color}, 'Sampling Points (' + count + ')');
+    
+    exportButton.setDisabled(false);
+    
+    resultsPanel.add(ui.Label('✓ Generated ' + count + ' stratified points (target: ' + totalSelected + ')', STYLES.SUCCESS));
+    print('✓ Generated ' + count + ' stratified sampling points');
+  });
+}
+
+function createLegend(numClusters) {
+  legendPanel.clear();
+  
+  var codes = numClusters ? 
+    Array.from({length: numClusters}, function(_, i) { return i; }) : 
+    COPERNICUS_STRATA.codes;
+  var names = numClusters ? 
+    Stratifier.generateClusterNames(numClusters) : 
+    COPERNICUS_STRATA.names;
+  var palette = numClusters ? 
+    Stratifier.generateClusterPalette(numClusters) : 
+    COPERNICUS_STRATA.palette;
+  
+  codes.forEach(function(code, index) {
+    var colorBox = ui.Label('', {
+      backgroundColor: palette[index],
+      padding: '10px',
+      margin: '0 8px 0 0'
+    });
+    
+    var label = ui.Label(names[index], {fontSize: '12px'});
+    
+    legendPanel.add(ui.Panel([colorBox, label], ui.Panel.Layout.flow('horizontal'), {margin: '4px 8px'}));
+  });
+  
+  if (!numClusters) {
+    legendPanel.add(ui.Label('Note: Water bodies excluded from sampling', 
+      {fontSize: '11px', color: '#999', margin: '8px', fontStyle: 'italic'}));
+  }
+}
+
+exportButton.onClick(function() {
+  if (!AppState.currentPoints) {
+    alert('Please generate points first.');
+    return;
+  }
+  
+  downloadLinksPanel.clear();
+  var format = formatSelect.getValue();
+  
+  var downloadUrl = AppState.currentPoints.getDownloadURL({
+    format: format === 'SHP' ? 'SHP' : format,
+    filename: 'stratified_sampling_points'
+  });
+  
+  var downloadLink = ui.Label({
+    value: '⬇️ Click to download ' + format + ' file',
+    style: {color: '#1976D2', textDecoration: 'underline', margin: '8px', fontWeight: 'bold'},
+    targetUrl: downloadUrl
+  });
+  
+  downloadLinksPanel.add(downloadLink);
+  print('✓ Export link generated');
+});
+
+function clearAll() {
+  AppState.reset();
+  map.layers().reset();
+  map.drawingTools().clear();
+  map.drawingTools().setShown(true);
+  resultsPanel.clear();
+  legendPanel.clear();
+  downloadLinksPanel.clear();
+  totalPointsBox.setValue('');
+  generateButton.setDisabled(true);
+  exportButton.setDisabled(true);
+  print('✓ Tool reset');
+}
+
+// =================================================================================
+// === 8. INITIALIZE ===============================================================
+// =================================================================================
+
+var drawingTools = map.drawingTools();
+drawingTools.setShown(true);
+drawingTools.setDrawModes(['polygon', 'rectangle']);
+drawingTools.setLinked(false);
+drawingTools.setShape('polygon');
+
+map.setControlVisibility({
+  all: false,
+  layerList: true,
+  zoomControl: true,
+  scaleControl: true,
+  mapTypeControl: true,
+  fullscreenControl: false,
+  drawingToolsControl: true
+});
+
+print('═══════════════════════════════════════════════════════');
+print('🌲 Nature Meets Carbon - Stratified Sampling Tool v2.1');
+print('═══════════════════════════════════════════════════════');
+print('');
+print('STRICT UNFCCC Method I (Eq. 5) - Multi-Strata Implementation');
+print('  n = [Σ(Ni×sti)]² / [(N×E/z)² + Σ(Ni×sti²)]');
+print('');
+print('Key Features:');
+print('  • Per-stratum Bayesian blending (not global)');
+print('  • Weighted mean carbon for allowable error');
+print('  • Neyman optimal allocation (Eq. 6)');
+print('  • A_ref = 200,000 ha per stratum');
+print('');
+print('Stratification Methods:');
+print('  1. Copernicus Land Cover (5 predefined classes)');
+print('  2. Google Embeddings AI (auto-optimized 2-10 clusters)');
+print('');
+print('Ready to use!');
