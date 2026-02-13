@@ -538,8 +538,13 @@ var StratifiedSampler = {
           // Add sequential IDs
           var pointsList = combinedPoints.toList(combinedPoints.size());
           pointsList.size().evaluate(function(listSize) {
+            if (!listSize || listSize <= 0) {
+              callback(ee.FeatureCollection([]), null);
+              return;
+            }
+
             var sequence = ee.List.sequence(0, listSize - 1);
-            
+
             var finalPoints = ee.FeatureCollection(
               sequence.map(function(idx) {
                 var pt = ee.Feature(pointsList.get(idx));
@@ -549,10 +554,10 @@ var StratifiedSampler = {
                 });
               })
             );
-            
+
             print('✓ Total points generated:', listSize);
             print('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-            
+
             callback(finalPoints, null);
           });
         }
@@ -1005,9 +1010,9 @@ function finishDrawing() {
     'Stratum: ' + name
   );
   
-  // Clear status message after 3 seconds
-  setTimeout(function() { 
-    drawingStatusLabel.setValue(''); 
+  // Clear status message after 3 seconds (GEE UI runtime-safe)
+  ui.util.setTimeout(function() {
+    drawingStatusLabel.setValue('');
   }, 3000);
   
   print('✓ Added stratum "' + name + '" with ' + 
@@ -1512,7 +1517,7 @@ function generatePoints() {
         // Clear previous layers
         var layersToRemove = [];
         map.layers().forEach(function(layer) {
-          if (layer.getName() === 'Sampling Points') {
+          if (layer.getName().indexOf('Sampling Points') === 0) {
             layersToRemove.push(layer);
           }
         });
